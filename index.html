@@ -1417,6 +1417,7 @@ async function api(path, opts = {}) {
 }
 
 function handle401() {
+  disconnectLive();
   setToken('');
   setLoggedUser('');
   showLogin('Sesión expirada o no autorizada.');
@@ -1595,11 +1596,15 @@ async function loginDashboard() {
   try {
     const r = await fetch(apiUrl('/api/login'), { method:'POST', headers:{ 'Content-Type':'application/json' }, body: JSON.stringify({ username: user, password: pass }) });
     const j = await r.json().catch(() => ({}));
+    if (r.status === 404 && !API_BASE) {
+      throw new Error('este dominio no tiene API (404). Escribe la URL del bot en «Servidor API» (http://IP:PUERTO) o abre el panel con ?api=http://IP:PUERTO');
+    }
     if (!r.ok || !j.ok) throw new Error(j.error || ('HTTP ' + r.status));
     setToken(j.token);
     setLoggedUser(j.user || user);
     authExpiredShown = false;
     hideLogin();
+    connectLive();
     if (msg) msg.textContent = '';
     const passInput = document.getElementById('loginPass');
     if (passInput) passInput.value = '';
@@ -1619,8 +1624,12 @@ async function loginDashboard() {
     if (results.some((x) => x.status === 'rejected')) toast('Sesión iniciada, pero algunos módulos no cargaron.', 'warn');
     else toast('Bienvenido, ' + (j.user || user), 'success');
   } catch (e) {
-    if (msg) msg.textContent = 'Error: ' + e.message;
-    toast('No se pudo iniciar sesión: ' + e.message, 'error');
+    let text = e.message;
+    if (e instanceof TypeError && location.protocol === 'https:' && /^http:\/\//i.test(API_BASE)) {
+      text = 'el navegador bloqueó la conexión: el panel es HTTPS y el bot HTTP. Pon HTTPS en el bot (túnel/dominio) o usa el proxy de Vercel';
+    }
+    if (msg) msg.textContent = 'Error: ' + text;
+    toast('No se pudo iniciar sesión: ' + text, 'error');
     screen?.classList.add('shake');
     setTimeout(() => screen?.classList.remove('shake'), 420);
   } finally {
@@ -1628,6 +1637,7 @@ async function loginDashboard() {
   }
 }
 function logoutDashboard() {
+  disconnectLive();
   setToken('');
   setLoggedUser('');
   showLogin('Sesión del panel cerrada.');
@@ -2993,6 +3003,40 @@ async function refreshAll(btn = null) {
   }
 }
 
+// -------- Tiempo real (SSE) --------
+// El bot empuja status/qr/history por /api/events; si se cae, el sondeo de
+// startTimers() sigue funcionando como respaldo.
+let liveSource = null;
+let liveErrors = 0;
+function connectLive() {
+  if (liveSource || !getToken() || typeof EventSource === 'undefined') return;
+  try {
+    liveSource = new EventSource(apiUrl('/api/events') + '?token=' + encodeURIComponent(getToken()));
+  } catch {
+    liveSource = null;
+    return;
+  }
+  liveSource.onopen = () => { liveErrors = 0; };
+  liveSource.addEventListener('status', () => { loadStatus(null, { quiet:true }); });
+  liveSource.addEventListener('qr', () => { loadStatus(null, { quiet:true }); });
+  liveSource.addEventListener('history', () => {
+    if (document.querySelector('.nav-item.active')?.dataset.tab !== 'history') return;
+    loadHistoryChats({ silent:true, quiet:true }).then(() => {
+      if (currentChatHistory) openHistory(encodeURIComponent(currentChatHistory), { silent:true });
+    });
+  });
+  liveSource.onerror = () => {
+    liveErrors += 1;
+    // EventSource reintenta solo; si el token no vale o el host no responde, no insistimos.
+    if (liveErrors >= 6) disconnectLive();
+  };
+}
+function disconnectLive() {
+  try { liveSource?.close(); } catch {}
+  liveSource = null;
+  liveErrors = 0;
+}
+
 function startTimers() {
   setInterval(() => {
     if (!getToken() || document.hidden) return;
@@ -3042,6 +3086,7 @@ async function boot() {
   setSplash(8, 'Preparando núcleo…');
   if (token) {
     hideLogin();
+    connectLive();
     setSplash(24, 'Validando credenciales…');
     try {
       await Promise.race([loadStatus(null, { quiet:true }), delay(3800)]);
